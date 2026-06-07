@@ -1,6 +1,8 @@
 import logging
 import re
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -24,36 +26,22 @@ HEADERS = {
 }
 
 BRAND_NORMALIZE = {
-    "SKODA": "Skoda",
-    "Skoda": "Skoda",
-    "DS": "DS",
-    "Ds": "DS",
-    "ds": "DS",
-    "Mercedes Benz": "Mercedes-Benz",
-    "Mercedes": "Mercedes-Benz",
-    "mercedes": "Mercedes-Benz",
-    "VW": "Volkswagen",
-    "Vw": "Volkswagen",
-    "Seat": "SEAT",
-    "Byd": "BYD",
-    "Mg": "MG",
-    "Ram": "RAM",
-    "Jac": "JAC",
-    "Bmw": "BMW",
-    "Gwm": "GWM",
-    "Baic": "BAIC",
-    "Chery": "Chery",
-    "Dfsk": "DFSK",
-    "Zna": "ZNA",
-    "Daf": "DAF",
-    "Man": "MAN",
-    "Iveco": "IVECO",
+    "SKODA": "Skoda", "Skoda": "Skoda", "DS": "DS", "Ds": "DS", "ds": "DS",
+    "Mercedes Benz": "Mercedes-Benz", "Mercedes": "Mercedes-Benz", "mercedes": "Mercedes-Benz",
+    "VW": "Volkswagen", "Vw": "Volkswagen", "Seat": "SEAT", "Byd": "BYD",
+    "Mg": "MG", "Ram": "RAM", "Jac": "JAC", "Bmw": "BMW", "Gwm": "GWM",
+    "Baic": "BAIC", "Chery": "Chery", "Dfsk": "DFSK", "Zna": "ZNA",
+    "Daf": "DAF", "Man": "MAN", "Iveco": "IVECO",
+    "Peugeot": "Peugeot", "peugeot": "Peugeot",
+    "Landrover": "Land Rover", "land rover": "Land Rover",
+    "Mini Cooper": "Mini",
 }
 
 NON_BRAND_WORDS = {
     "motorhome", "housecar", "remolque", "trailer", "semi",
     "carroceria", "carrocería", "automotora", "concesionario",
     "otra marca", "otra", "bayliner", "randon", "semi remolque",
+    "hechizo", "carro de arrastre", "carro arrastre", "carroceria",
 }
 
 BRAND_FIXES = {
@@ -79,16 +67,37 @@ class ChileautosScraper:
         self._brand_cache = {}
         self._model_cache = {}
 
-    def scrape(self, max_pages: int = 3):
+    def scrape(self, max_pages: Optional[int] = None, start_offset: int = 0):
         session = get_session()
         total_saved = 0
+        total_new = 0
         seen_ids = set()
+        total_available = None
+        start_page = start_offset // PAGE_SIZE
+        page = start_page
+        empty_streak = 0
+
+        if start_offset > 0:
+            existing_ids = session.query(Listing.source_id).filter_by(source=self.source_name).all()
+            seen_ids = {row[0] for row in existing_ids}
+            logger.info("Continuando desde offset %s. %s listings ya en BD.", start_offset, f"{len(seen_ids):,}")
 
         try:
-            for page in range(max_pages):
+            while True:
+                if max_pages is not None and page >= max_pages:
+                    break
+
                 offset = page * PAGE_SIZE
                 url = f"{API_URL}?offset={offset}"
-                logger.info("Fetching page %s/%s (offset=%s)", page + 1, max_pages, offset)
+
+                page_label = f"{page + 1}"
+                if total_available:
+                    est_pages = total_available // 9  # ~9 new unique per page
+                    page_label = f"{page + 1}/~{est_pages}"
+                elif max_pages:
+                    page_label = f"{page + 1}/{max_pages}"
+
+                logger.info("Fetching page %s (offset=%s)", page_label, offset)
 
                 try:
                     resp = self.client.get(url)
@@ -99,10 +108,23 @@ class ChileautosScraper:
                     logger.error("Request failed: %s", e)
                     break
 
+                if total_available is None:
+                    total_match = re.search(r'"searchResultCount"\s*:\s*(\d+)', resp.text)
+                    if not total_match:
+                        total_match = re.search(r'"listingresultcount"\s*:\s*"(\d+)"', resp.text)
+                    if total_match:
+                        total_available = int(total_match.group(1))
+                        logger.info("Total listings disponibles: %s", f"{total_available:,}")
+
                 listings = self._parse_listings(resp.text)
                 if not listings:
-                    logger.info("No more listings found at offset %s", offset)
-                    break
+                    empty_streak += 1
+                    if empty_streak >= 3:
+                        logger.info("3 páginas vacías consecutivas, deteniendo.")
+                        break
+                    page += 1
+                    continue
+                empty_streak = 0
 
                 new_on_page = 0
                 for listing_data in listings:
@@ -136,6 +158,7 @@ class ChileautosScraper:
                         else:
                             existing.last_seen = datetime.now(timezone.utc)
                         session.flush()
+                        total_saved += 1
                         continue
 
                     brand, model = self._find_or_create_brand_model(
@@ -147,6 +170,7 @@ class ChileautosScraper:
                     session.add(listing)
                     try:
                         session.flush()
+                        total_new += 1
                         total_saved += 1
                         new_on_page += 1
                     except Exception:
@@ -154,21 +178,73 @@ class ChileautosScraper:
                         logger.debug("Skipped duplicate: %s", nid)
 
                 session.commit()
+
+                pct = ""
+                if total_available:
+                    pct = f" ({seen_ids.__len__() / total_available * 100:.1f}%)"
                 logger.info(
-                    "Page %s done: %s new, %s total unique so far",
-                    page + 1, new_on_page, total_saved,
+                    "Page %s: +%s nuevos, %s total únicos%s",
+                    page + 1, new_on_page, f"{total_saved:,}", pct,
                 )
 
                 if new_on_page == 0:
-                    logger.info("No new listings on this page, stopping.")
+                    logger.info("Sin listings nuevos, deteniendo.")
                     break
+
+                page += 1
+                time.sleep(settings.request_delay)
 
         finally:
             session.close()
             self.client.close()
 
-        logger.info("Scraping finished. Total new listings: %s", total_saved)
+        logger.info("Scraping finalizado. %s nuevos, %s total.", f"{total_new:,}", f"{total_saved:,}")
+
+        self._export_parquet()
         return total_saved
+
+    def _export_parquet(self):
+        try:
+            import pandas as pd
+
+            session = get_session()
+            rows = (
+                session.query(
+                    Brand.name.label("marca"),
+                    Model.name.label("modelo"),
+                    Listing.year.label("año"),
+                    Listing.price.label("precio_clp"),
+                    Listing.currency.label("moneda"),
+                    Listing.mileage_km.label("kilometraje"),
+                    Listing.location.label("region"),
+                    Listing.is_sold.label("vendido"),
+                    Listing.url,
+                    Listing.source.label("fuente"),
+                    Listing.source_id,
+                    Listing.first_seen,
+                    Listing.last_seen,
+                )
+                .outerjoin(Brand, Listing.brand_id == Brand.id)
+                .outerjoin(Model, Listing.model_id == Model.id)
+                .order_by(Listing.price.desc())
+                .all()
+            )
+
+            df = pd.DataFrame(rows, columns=[
+                "marca", "modelo", "año", "precio_clp", "moneda", "kilometraje",
+                "region", "vendido", "url", "fuente", "source_id",
+                "primera_vez_visto", "ultima_vez_visto",
+            ])
+
+            out = Path(settings.data_dir) / "listings.parquet"
+            df.to_parquet(out, index=False)
+            logger.info("Parquet exportado: %s (%s registros)", out, f"{len(df):,}")
+
+            session.close()
+        except ImportError:
+            logger.warning("pandas/pyarrow no instalado, no se exporto Parquet.")
+        except Exception as e:
+            logger.warning("Error exportando Parquet: %s", e)
 
     def _parse_listings(self, text: str) -> list[dict]:
         results = []
@@ -211,7 +287,6 @@ class ChileautosScraper:
         year_str = data.get("year", "")
         price_str = data.get("price", "")
         state = data.get("state", "")
-        adtype = data.get("type", "")
 
         url = f"{BASE_URL}/vehiculos/detalle/{nid}/" if nid else ""
 
