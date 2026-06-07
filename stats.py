@@ -3,7 +3,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from sqlalchemy import func
+try:
+    from sqlalchemy import func
+except ImportError:
+    print("ERROR: sqlalchemy no está instalado.")
+    print("Ejecutá: pip3 install --break-system-packages sqlalchemy")
+    sys.exit(1)
 
 from src.database.connection import init_db, get_session
 from src.database.models import Brand, Model, Listing
@@ -30,8 +35,10 @@ def main():
         func.min(Listing.year), func.avg(Listing.year), func.max(Listing.year)
     ).filter(Listing.year.isnot(None)).first()
 
-    print(f"  Precios: ${price_stats[0]:,.0f} ~ ${price_stats[1]:,.0f} (prom) ~ ${price_stats[2]:,.0f}")
-    print(f"  Años:    {int(year_stats[0])} ~ {year_stats[1]:.0f} (prom) ~ {int(year_stats[2])}")
+    if price_stats[0]:
+        print(f"  Precios: ${price_stats[0]:,.0f} ~ ${price_stats[1]:,.0f} (prom) ~ ${price_stats[2]:,.0f}")
+    if year_stats[0]:
+        print(f"  Años:    {int(year_stats[0])} ~ {year_stats[1]:.0f} (prom) ~ {int(year_stats[2])}")
     print()
 
     print("--- Top 15 marcas ---")
